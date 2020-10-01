@@ -158,7 +158,6 @@ static void sendStatusLine(int clntSock, int statusCode)
 static int handleFileRequest(
         const char *webRoot, const char *requestURI, int clntSock, sem_t *semptr, int *shmptr)
 {
-    printf("url: %s", requestURI);
     int statusCode;
     FILE *fp = NULL;
 
