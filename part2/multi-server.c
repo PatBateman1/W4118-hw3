@@ -455,7 +455,7 @@ loop_end:
         } else {
             close(clntSock);
             pid_t cpid;
-            while ((cpid = waitpid(-1, NULL, WNOHANG)) >= 0);
+            while ((cpid = waitpid(-1, NULL, WNOHANG)) > 0);
         }
 
     } // for (;;)
