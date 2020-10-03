@@ -393,10 +393,12 @@ int main(int argc, char *argv[])
         if (pthread_create(&tid, NULL, handleRequest, param) != 0)
             die("pthread_create() failed");
         thread_pool[i] = tid;
-        if (pthread_join(tid, NULL) != 0)
+        
+    }
+    for (i=0; i<N_THREADS; i++) {
+        if (pthread_join(thread_pool[i], NULL) != 0)
             die("pthread_join() failed");
     }
-
     return 0;
 }
 
