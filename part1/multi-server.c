@@ -361,7 +361,7 @@ loop_end:
             * connection.
             */
 
-            fprintf(stderr, "%s \"%s %s %s\" %d %s cpid: %d\n",
+            fprintf(stderr, "%s \"%s %s %s\" %d %s currpid: %d\n",
                     inet_ntoa(clntAddr.sin_addr),
                     method,
                     requestURI,
@@ -377,7 +377,7 @@ loop_end:
         } else {
             close(clntSock);
             pid_t cpid;
-            while ((cpid = waitpid(-1, NULL, WNOHANG)) >= 0);
+            while ((cpid = waitpid(-1, NULL, WNOHANG)) > 0);
         }
 
     } // for (;;)
