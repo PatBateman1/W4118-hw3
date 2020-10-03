@@ -13,18 +13,20 @@
 #include <signal.h>     /* for signal() */
 #include <sys/stat.h>   /* for stat() */
 #include <sys/wait.h>   /* for waitpid() */
-#include <sys/shm.h>    /* for shmget() */
 #include <semaphore.h>  /* for sem_open() */
 #include <fcntl.h>      /* for O_CREAT */
+#include <sys/mman.h>   /* for mmap() */
+#include <errno.h>      /* for errno */
 
 
 #define MAXPENDING 5    /* Maximum outstanding connection requests */
 
 #define DISK_IO_BUF_SIZE 4096
 
-#define SHM_SIZE 1000
-
-#define SHM_MODE 0600
+struct data {
+    int stat[5];
+    sem_t semptr;
+};
 
 static void die(const char *message)
 {
@@ -117,6 +119,22 @@ static inline const char *getReasonPhrase(int statusCode)
     return "Unknown Status Code";
 }
 
+/*
+ * handel statistics  
+ */
+void handleStat(struct data *data, int statusCode, sem_t *semptr) {
+    int index = statusCode / 100 - 1;
+    while (sem_wait(semptr) == -1) {
+        if (errno == EINTR) 
+            continue;
+        else
+            die("sem_wait() failed");
+    }
+    data->stat[0]++;
+    data->stat[index]++;
+    if (sem_post(semptr) == -1)
+        die("sem_post() failed");
+}
 
 /*
  * Send HTTP status line followed by a blank line.
@@ -156,7 +174,7 @@ static void sendStatusLine(int clntSock, int statusCode)
  * Returns the HTTP status code that was sent to the browser.
  */
 static int handleFileRequest(
-        const char *webRoot, const char *requestURI, int clntSock, sem_t *semptr, int *shmptr)
+        const char *webRoot, const char *requestURI, int clntSock, sem_t *semptr, struct data *data)
 {
     int statusCode;
     FILE *fp = NULL;
@@ -178,9 +196,13 @@ static int handleFileRequest(
     // enable the statistics page
 
     if (strcmp(requestURI, "/statistics") == 0) {
-        sem_wait(semptr);
-        shmptr[1]++;
-        sem_post(semptr);
+        statusCode = 200;
+        while (sem_wait(semptr) == -1) {
+            if (errno == EINTR) 
+                continue;
+            else
+                die("sem_wait() failed");
+        }
         char stats[1000];
         sprintf(stats, 
                 "<html><body>\n"
@@ -190,8 +212,10 @@ static int handleFileRequest(
                 "<h4>3xx: %d</h4>\n"
                 "<h4>4xx: %d</h4>\n"
                 "<h4>5xx: %d</h4>\n"
-                "</body></html>\n", shmptr[0], shmptr[1], shmptr[2], shmptr[3], shmptr[4]);
-        sendStatusLine(clntSock, 200);
+                "</body></html>\n", data->stat[0], data->stat[1], data->stat[2], data->stat[3], data->stat[4]);
+        if (sem_post(semptr) == -1)
+            die("sem_post() failed");
+        sendStatusLine(clntSock, statusCode);
         Send(clntSock, stats);
         goto func_end;
     }
@@ -201,10 +225,6 @@ static int handleFileRequest(
     if (stat(file, &st) == 0 && S_ISDIR(st.st_mode)) {
 
         statusCode = 200; // "ok"
-        sem_wait(semptr);
-        shmptr[1]++;
-        sem_post(semptr);
-
         pid_t pid;
         int fd[2];
         if (pipe(fd) < 0)
@@ -223,10 +243,8 @@ static int handleFileRequest(
             if (dup2(fd[1], STDERR_FILENO) != STDERR_FILENO) 
                 die("dup2() failed");
  
-            char path[] = "../webroot";
-            strcat(path, requestURI);
-            execl("/bin/ls", "ls", "-al", path, NULL);
-
+            close(fd[1]);
+            execl("/bin/ls", "ls", "-al", file, NULL);
             exit(1);
         } else {
             // parent
@@ -254,9 +272,6 @@ static int handleFileRequest(
     fp = fopen(file, "rb");
     if (fp == NULL) {
         statusCode = 404; // "Not Found"
-        sem_wait(semptr);
-        shmptr[3]++;
-        sem_post(semptr);
         sendStatusLine(clntSock, statusCode);
         goto func_end;
     }
@@ -264,9 +279,6 @@ static int handleFileRequest(
     // Otherwise, send "200 OK" followed by the file content.
 
     statusCode = 200; // "OK"
-    sem_wait(semptr);
-    shmptr[1]++;
-    sem_post(semptr);
     sendStatusLine(clntSock, statusCode);
 
     // send the file 
@@ -319,14 +331,18 @@ int main(int argc, char *argv[])
     char requestLine[1000];
     int statusCode;
     struct sockaddr_in clntAddr;
-    int shmid;
-    sem_t *semptr;
+    void *area;
 
-    if ((shmid = shmget(0, SHM_SIZE, SHM_MODE)) < 0)
-        die("shmget() failed");
+    if ((area = mmap(0, sizeof(struct data), PROT_READ | PROT_WRITE,
+        MAP_ANON | MAP_SHARED, -1, 0)) == MAP_FAILED)
+        die("mmap() failed");
+    
+    struct data *data = (struct data *) area;
 
-    if ((semptr = sem_open("/lock", O_CREAT)) == SEM_FAILED)
-        die("sem_open() failed");
+    memset(data, 0, sizeof(struct data));
+
+    if (sem_init(&data->semptr, 1, 1) == -1)
+        die("sem_init() failed");
 
     for (;;) {
 
@@ -350,16 +366,6 @@ int main(int argc, char *argv[])
             // child
             close(servSock);
 
-            // shared memory
-            int *shmptr;
-            if ((shmptr = shmat(shmid, 0, 0)) == (void*) -1)
-                die("shmat() failed");
-            
-            // increase request stat
-            sem_wait(semptr);
-            shmptr[0]++;
-            sem_post(semptr);
-
             FILE *clntFp = fdopen(clntSock, "r");
             if (clntFp == NULL)
                 die("fdopen failed");
@@ -375,9 +381,6 @@ int main(int argc, char *argv[])
             if (fgets(requestLine, sizeof(requestLine), clntFp) == NULL) {
                 // socket closed - there isn't much we can do
                 statusCode = 400; // "Bad Request"
-                sem_wait(semptr);
-                shmptr[3]++;
-                sem_post(semptr);
                 goto loop_end;
             }
 
@@ -391,9 +394,6 @@ int main(int argc, char *argv[])
             if (!method || !requestURI || !httpVersion || 
                     extraThingsOnRequestLine) {
                 statusCode = 501; // "Not Implemented"
-                sem_wait(semptr);
-                shmptr[4]++;
-                sem_post(semptr);
                 sendStatusLine(clntSock, statusCode);
                 goto loop_end;
             }
@@ -401,9 +401,6 @@ int main(int argc, char *argv[])
             // we only support GET method 
             if (strcmp(method, "GET") != 0) {
                 statusCode = 501; // "Not Implemented"
-                sem_wait(semptr);
-                shmptr[4]++;
-                sem_post(semptr);
                 sendStatusLine(clntSock, statusCode);
                 goto loop_end;
             }
@@ -412,9 +409,6 @@ int main(int argc, char *argv[])
             if (strcmp(httpVersion, "HTTP/1.0") != 0 && 
                 strcmp(httpVersion, "HTTP/1.1") != 0) {
                 statusCode = 501; // "Not Implemented"
-                sem_wait(semptr);
-                shmptr[4]++;
-                sem_post(semptr);
                 sendStatusLine(clntSock, statusCode);
                 goto loop_end;
             }
@@ -422,9 +416,6 @@ int main(int argc, char *argv[])
             // requestURI must begin with "/"
             if (!requestURI || *requestURI != '/') {
                 statusCode = 400; // "Bad Request"
-                sem_wait(semptr);
-                shmptr[3]++;
-                sem_post(semptr);
                 sendStatusLine(clntSock, statusCode);
                 goto loop_end;
             }
@@ -438,9 +429,6 @@ int main(int argc, char *argv[])
                         strstr(requestURI, "/../") != NULL)
                 {
                     statusCode = 400; // "Bad Request"
-                    sem_wait(semptr);
-                    shmptr[3]++;
-                    sem_post(semptr);
                     sendStatusLine(clntSock, statusCode);
                     goto loop_end;
                 }
@@ -454,9 +442,6 @@ int main(int argc, char *argv[])
                 if (fgets(line, sizeof(line), clntFp) == NULL) {
                     // socket closed prematurely - there isn't much we can do
                     statusCode = 400; // "Bad Request"
-                    sem_wait(semptr);
-                    shmptr[3]++;
-                    sem_post(semptr);
                     goto loop_end;
                 }
                 if (strcmp("\r\n", line) == 0 || strcmp("\n", line) == 0) {
@@ -471,9 +456,10 @@ int main(int argc, char *argv[])
             * Let's handle it.
             */
 
-            statusCode = handleFileRequest(webRoot, requestURI, clntSock, semptr, shmptr);
+            statusCode = handleFileRequest(webRoot, requestURI, clntSock, &data->semptr, data);
 
 loop_end:
+            handleStat(data, statusCode, &data->semptr);
 
             /*
             * Done with client request.
@@ -493,7 +479,6 @@ loop_end:
             // close the client socket 
             fclose(clntFp);
             close(clntSock);
-            shmdt(shmptr);
             exit(1);
         } else {
             close(clntSock);
@@ -502,8 +487,6 @@ loop_end:
         }
 
     } // for (;;)
-    sem_close(semptr);
-    sem_unlink("/lock");
     return 0;
 }
 
