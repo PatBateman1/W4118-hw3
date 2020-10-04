@@ -268,10 +268,11 @@ void * handleRequest(void *arg)
         }
 
         char *token_separators = "\t \r\n"; // tab, space, new line
-        method = strtok(requestLine, token_separators);
-        requestURI = strtok(NULL, token_separators);
-        httpVersion = strtok(NULL, token_separators);
-        char *extraThingsOnRequestLine = strtok(NULL, token_separators);
+        char *saveptr = requestLine;
+        method = strtok_r(requestLine, token_separators, &saveptr);
+        requestURI = strtok_r(NULL, token_separators, &saveptr);
+        httpVersion = strtok_r(NULL, token_separators, &saveptr);
+        char *extraThingsOnRequestLine = strtok_r(NULL, token_separators, &saveptr);
 
         // check if we have 3 (and only 3) things in the request line
         if (!method || !requestURI || !httpVersion || 
@@ -364,6 +365,7 @@ loop_end:
         fclose(clntFp);
 
     } // for (;;)
+    return (void *) 0;
 }
 
 
